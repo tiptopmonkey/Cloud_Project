@@ -1,0 +1,54 @@
+import cv2
+import numpy as np
+import tensorflow as tf
+
+# ============================================================
+# UBIBC DATASET PIPELINE (FPGA Domain Alignment)
+# ============================================================
+UBIBC_TRAIN_DIR = "/kaggle/input/datasets/vuppalaadithyasairam/ultrasound-breast-images-for-breast-cancer/ultrasound breast classification/train"
+UBIBC_TEST_DIR = "/kaggle/input/datasets/vuppalaadithyasairam/ultrasound-breast-images-for-breast-cancer/ultrasound breast classification/val"
+BATCH_SIZE = 64
+
+print("Loading UBIBC dataset with FPGA-optimized alignment...")
+
+# 1. Hardware Alignment Function (Matches BUSI style)
+def align_to_busi_features(image):
+    # Convert TF tensor to uint8 for OpenCV processing
+    img = image.numpy().astype(np.uint8)
+    
+    # Apply enhancements to match BUSI's processed style
+    img = cv2.equalizeHist(img) # Matches contrast
+    img = cv2.bilateralFilter(img, 9, 75, 75) # Removes noise, keeps edges
+    
+    # Cast to float16 and normalize to [0,1] for FPGA compatibility
+    return img.astype(np.float16) / 255.0
+
+# 2. TensorFlow Wrapper
+def tf_fpga_align(image, label):
+    # Wrap the OpenCV function
+    aligned_img = tf.py_function(func=align_to_busi_features, inp=[image], Tout=tf.float16)
+    aligned_img.set_shape((128, 128, 1)) 
+    
+    return aligned_img, tf.cast(label, tf.float32)
+
+# 3. Load Datasets
+train_dataset = tf.keras.utils.image_dataset_from_directory(
+    UBIBC_TRAIN_DIR, validation_split=0.2, subset="training", seed=123,
+    color_mode="grayscale", image_size=(128, 128), batch_size=BATCH_SIZE, label_mode='int'
+)
+
+valid_dataset = tf.keras.utils.image_dataset_from_directory(
+    UBIBC_TRAIN_DIR, validation_split=0.2, subset="validation", seed=123,
+    color_mode="grayscale", image_size=(128, 128), batch_size=BATCH_SIZE, label_mode='int'
+)
+
+test_dataset = tf.keras.utils.image_dataset_from_directory(
+    UBIBC_TEST_DIR, color_mode="grayscale", image_size=(128, 128), batch_size=BATCH_SIZE, label_mode='int'
+)
+
+# 4. Apply Mapping (No more Rescaling layer needed!)
+train_dataset = train_dataset.map(tf_fpga_align, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+valid_dataset = valid_dataset.map(tf_fpga_align, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+test_dataset = test_dataset.map(tf_fpga_align, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+
+print("UBIBC pipeline aligned and optimized for training.")

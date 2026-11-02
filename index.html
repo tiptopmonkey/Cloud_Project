@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cloud AI Ultrasound Clinical Portal</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f0f4f8; color: #2d3748; margin: 0; padding: 30px; }
+        .wrapper { max-width: 950px; margin: 0 auto; }
+        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); margin-bottom: 25px; }
+        h2, h3 { color: #1a365d; margin-top: 0; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        input[type="text"], input[type="password"], input[type="file"] { width: 100%; padding: 10px; margin: 8px 0 16px 0; border: 1px solid #cbd5e0; border-radius: 6px; box-sizing: border-box; }
+        button { background-color: #2b6cb0; color: white; border: none; padding: 12px 20px; font-size: 15px; font-weight: 600; border-radius: 6px; cursor: pointer; width: 100%; }
+        button:hover { background-color: #2c5282; }
+        .btn-pdf { background-color: #2f855a; margin-top: 12px; display: inline-block; text-decoration: none; text-align: center; box-sizing: border-box; }
+        .badge { display: inline-block; padding: 6px 12px; border-radius: 20px; font-size: 13px; font-weight: bold; }
+        .benign { background-color: #c6f6d5; color: #22543d; }
+        .malignant { background-color: #fed7d7; color: #742a2a; }
+        #preview { max-width: 220px; border-radius: 8px; display: none; margin: 10px auto; border: 2px solid #e2e8f0; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 14px; }
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #e2e8f0; }
+        th { background-color: #edf2f7; color: #4a5568; }
+        #dashboardSection { display: none; }
+        .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+
+<div class="wrapper">
+    <!-- 1. CLINICIAN LOGIN SCREEN (FOR SLIDE 9 LOGIN SCREENSHOT) -->
+    <div id="loginSection" class="card" style="max-width: 420px; margin: 60px auto;">
+        <h2>Clinician IAM Portal Login</h2>
+        <p style="color: #718096; font-size: 14px;">Authenticate to access AWS Serverless Ultrasound Diagnostics & S3 Medical Vault.</p>
+        <label>Clinician ID / Role</label>
+        <input type="text" id="clinicianId" value="DR-POORNESH-VIT">
+        <label>Access Passkey</label>
+        <input type="password" id="passkey" value="********">
+        <button onclick="login()">Authenticate Session</button>
+    </div>
+
+    <!-- 2. MAIN CLINICAL DASHBOARD -->
+    <div id="dashboardSection">
+        <div class="topbar">
+            <h2>AWS Serverless Breast Ultrasound Diagnostic Portal</h2>
+            <span class="badge benign" id="authBadge">IAM Verified: DR-POORNESH-VIT</span>
+        </div>
+
+        <div class="grid">
+            <!-- Left Column: Patient Intake & Scan Upload -->
+            <div class="card">
+                <h3>1. Patient Intake & Scan Upload</h3>
+                <label>Patient ID</label>
+                <input type="text" id="patientId" placeholder="e.g., PT-2026-089" value="PT-2026-089">
+                
+                <label>Patient Full Name</label>
+                <input type="text" id="patientName" placeholder="e.g., Ananya Sharma" value="Ananya Sharma">
+                
+                <label>Referring Specialist Doctor</label>
+                <input type="text" id="doctorName" placeholder="e.g., Dr. R. Subramanian (Oncology)" value="Dr. R. Subramanian">
+
+                <label>Ultrasound Scan Image</label>
+                <input type="file" id="imageInput" accept="image/*">
+                <img id="preview" src="" alt="Scan Preview">
+
+                <button id="predictBtn" onclick="predict()" style="display:none;">Run Cloud AI & Share with Doctor</button>
+            </div>
+
+            <!-- Right Column: Live Cloud Output & S3/SNS Sharing Status -->
+            <div class="card">
+                <h3>2. Diagnostic Telemetry & Cloud Sharing</h3>
+                <div id="resultPlaceholder" style="color: #a0aec0; padding: 40px 0; text-align: center;">
+                    Upload a scan to trigger AWS Lambda, S3 PDF encryption, DynamoDB logging, and Amazon SNS Doctor Alerts.
+                </div>
+
+                <div id="resultBox" style="display: none;">
+                    <p><strong>Scan Reference ID:</strong> <span id="resScanId"></span></p>
+                    <p><strong>Prediction:</strong> <span id="resDiagnosis" class="badge"></span></p>
+                    <p><strong>Model Confidence:</strong> <span id="resConfidence"></span>%</p>
+                    <p style="font-size: 13px; color: #4a5568;">
+                        <strong>Storage:</strong> Encrypted in Amazon S3 (SSE-S3)<br>
+                        <strong>Database:</strong> Logged in Amazon DynamoDB<br>
+                        <strong>Doctor Alert:</strong> <span style="color: #2f855a; font-weight: bold;">Dispatched via Amazon SNS Email</span>
+                    </p>
+                    <a id="pdfDownloadLink" href="#" target="_blank" class=" btn-pdf" style="padding: 12px; color: white; width: 100%; border-radius: 6px;">
+                        Download Official PDF Report (24h Pre-Signed S3 URL)
+                    </a>
+                </div>
+            </div>
+        </div>
+
+        <!-- 3. DYNAMODB LIVE PATIENT HISTORY TABLE -->
+        <div class="card">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <h3>3. Live Amazon DynamoDB Patient Records</h3>
+                <button onclick="loadHistory()" style="width: auto; padding: 8px 16px; font-size: 13px;">Refresh DynamoDB Table</button>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Scan ID</th>
+                        <th>Timestamp (IST)</th>
+                        <th>Patient</th>
+                        <th>Specialist</th>
+                        <th>Diagnosis</th>
+                        <th>Confidence</th>
+                        <th>S3 Pre-Signed Report</th>
+                    </tr>
+                </thead>
+                <tbody id="historyTableBody">
+                    <tr><td colspan="7" style="text-align:center;">Loading records from Amazon DynamoDB...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script>
+    const API_URL = "https://jff4nvcjo4z45q7sx4umdxcmia0rwofi.lambda-url.eu-north-1.on.aws/";
+    let base64Image = "";
+
+    function login() {
+        const id = document.getElementById('clinicianId').value || "DR-CLINICIAN";
+        document.getElementById('authBadge').innerText = "IAM Verified: " + id;
+        document.getElementById('loginSection').style.display = "none";
+        document.getElementById('dashboardSection').style.display = "block";
+        loadHistory();
+    }
+
+    document.getElementById('imageInput').addEventListener('change', function(event) {
+        const file = event.target.files[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                document.getElementById('preview').src = e.target.result;
+                document.getElementById('preview').style.display = "block";
+                document.getElementById('predictBtn').style.display = "block";
+                base64Image = e.target.result.split(',')[1];
+            };
+            reader.readAsDataURL(file);
+        }
+    });
+
+    async function predict() {
+        const btn = document.getElementById('predictBtn');
+        btn.innerText = "Executing Lambda + S3 + DynamoDB + SNS...";
+        btn.disabled = true;
+
+        try {
+            const payload = {
+                action: "analyze",
+                image: base64Image,
+                patient_id: document.getElementById('patientId').value,
+                patient_name: document.getElementById('patientName').value,
+                doctor_name: document.getElementById('doctorName').value
+            };
+
+            const response = await fetch(API_URL, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+            });
+
+            const data = await response.json();
+            if (data.error) throw new Error(data.error);
+
+            document.getElementById('resultPlaceholder').style.display = "none";
+            document.getElementById('resultBox').style.display = "block";
+            document.getElementById('resScanId').innerText = data.scan_id;
+            
+            const diagSpan = document.getElementById('resDiagnosis');
+            diagSpan.innerText = data.diagnosis.toUpperCase();
+            diagSpan.className = "badge " + (data.diagnosis.toLowerCase() === 'benign' ? 'benign' : 'malignant');
+            
+            document.getElementById('resConfidence').innerText = data.confidence;
+            document.getElementById('pdfDownloadLink').href = data.report_url;
+
+            await loadHistory();
+        } catch (error) {
+            alert("Cloud Pipeline Error: " + error.message);
+            console.error(error);
+        } finally {
+            btn.innerText = "Run Cloud AI & Share with Doctor";
+            btn.disabled = false;
+        }
+    }
+
+    async function loadHistory() {
+        const tbody = document.getElementById('historyTableBody');
+        try {
+            const response = await fetch(API_URL, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "history" })
+            });
+            const data = await response.json();
+            const records = data.records || [];
+
+            if (records.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;">No scans logged yet. Upload an ultrasound scan above.</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = records.map(r => `
+                <tr>
+                    <td><strong>${r.scan_id}</strong></td>
+                    <td>${r.timestamp}</td>
+                    <td>${r.patient_name} (${r.patient_id})</td>
+                    <td>${r.doctor_name || 'N/A'}</td>
+                    <td><span class="badge ${r.diagnosis.toLowerCase() === 'benign' ? 'benign' : 'malignant'}">${r.diagnosis}</span></td>
+                    <td>${r.confidence}%</td>
+                    <td><a href="${r.report_url}" target="_blank" style="color:#2b6cb0; font-weight:600;">View PDF</a></td>
+                </tr>
+            `).join('');
+        } catch (e) {
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:red;">Could not load DynamoDB history.</td></tr>';
+        }
+    }
+</script>
+</body>
+</html>

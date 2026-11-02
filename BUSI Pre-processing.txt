@@ -1,0 +1,95 @@
+import os
+import cv2
+import glob
+import numpy as np
+import tensorflow as tf
+from sklearn.model_selection import train_test_split
+
+# ============================================================
+# 2. BUSI DATASET PIPELINE (FP16 & Domain Aligned)
+# ============================================================
+BUSI_DIR = "/kaggle/input/datasets/poornesh1007/busi-dataset-2/BUSI/Dataset_BUSI_with_GT" 
+BATCH_SIZE = 64
+
+print("Loading and augmenting BUSI dataset...")
+
+# --- A. HELPER FUNCTIONS ---
+def apply_busi_augmentations(image):
+    """Applies the 4 specific mathematical enhancements from the paper."""
+    augments = []
+    augments.append(cv2.equalizeHist(image))
+    augments.append(cv2.GaussianBlur(image, (5, 5), 0))
+    augments.append(cv2.bilateralFilter(image, 9, 75, 75))
+    
+    pixel_values = np.float32(image.reshape((-1, 1)))
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+    _, labels, centers = cv2.kmeans(
+        pixel_values, 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS
+    )
+    centers = np.uint8(centers)
+    segmented_data = centers[labels.flatten()]
+    augments.append(segmented_data.reshape((128, 128)))
+    
+    return augments
+
+def process_and_normalize(img):
+    """Ensures 128x128x1 shape and strict FP16 range for FPGA."""
+    img = img.astype(np.float16) / 255.0
+    return np.expand_dims(img, axis=-1)
+
+# --- B. LOAD IMAGES INTO MEMORY ---
+images, labels = [], []
+
+for img_path in glob.glob(os.path.join(BUSI_DIR, "benign", "*.png")):
+    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    if img is not None:
+        images.append(cv2.resize(img, (128, 128), interpolation=cv2.INTER_AREA))
+        labels.append(0.0)
+
+for img_path in glob.glob(os.path.join(BUSI_DIR, "malignant", "*.png")):
+    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    if img is not None:
+        images.append(cv2.resize(img, (128, 128), interpolation=cv2.INTER_AREA))
+        labels.append(1.0)
+
+# --- C. SPLIT TO PREVENT DATA LEAKAGE ---
+X_train, X_val, y_train, y_val = train_test_split(
+    images, labels, test_size=0.2, random_state=123, stratify=labels
+)
+
+# --- D. APPLY AUGMENTATION TO TRAINING SET ONLY ---
+train_x_final, train_y_final = [], []
+
+for img, label in zip(X_train, y_train):
+    train_x_final.append(process_and_normalize(img))
+    train_y_final.append(label)
+    
+    for aug_img in apply_busi_augmentations(img):
+        train_x_final.append(process_and_normalize(aug_img))
+        train_y_final.append(label)
+
+train_x_final = np.array(train_x_final, dtype=np.float16)
+train_y_final = np.array(train_y_final, dtype=np.float32) # Labels must remain float32 for Focal Loss
+
+# --- E. PROCESS VALIDATION SET (DOMAIN ALIGNMENT) ---
+# FIX: We MUST apply the exact same hardware alignment here that UBIBC receives
+aligned_val_x = []
+for img in X_val:
+    aligned = cv2.equalizeHist(img)
+    aligned = cv2.bilateralFilter(aligned, 9, 75, 75)
+    aligned_val_x.append(process_and_normalize(aligned))
+
+val_x_final = np.array(aligned_val_x, dtype=np.float16)
+val_y_final = np.array(y_val, dtype=np.float32)
+
+print(f"BUSI Train set after augmentation: {train_x_final.shape[0]} images")
+print(f"BUSI Validation set (Aligned): {val_x_final.shape[0]} images")
+
+# --- F. CONVERT TO TF.DATA.DATASET ---
+busi_train_dataset = tf.data.Dataset.from_tensor_slices((train_x_final, train_y_final))
+busi_train_dataset = busi_train_dataset.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+busi_valid_dataset = tf.data.Dataset.from_tensor_slices((val_x_final, val_y_final))
+busi_valid_dataset = busi_valid_dataset.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+print("BUSI pipeline ready and aligned for merging!")

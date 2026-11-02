@@ -1,0 +1,329 @@
+# ============================================================
+# HistoFP16-Arty7: Lightweight IEEE-FP16 FPGA Pipeline
+# Target: Arty A7-100T | Optimizer: SGD + Nesterov
+# ============================================================
+
+import os
+import gc
+import cv2
+import glob
+import numpy as np
+import tensorflow as tf
+from sklearn.model_selection import train_test_split
+from tensorflow.keras import layers, regularizers
+from sklearn.svm import SVC
+from sklearn.preprocessing import Normalizer  
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import confusion_matrix, roc_auc_score, f1_score, accuracy_score
+from sklearn.utils import shuffle
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+tf.keras.backend.clear_session()
+gc.collect()
+
+# ============================================================
+# 1. MIXED FP16 TRAINING
+# ============================================================
+policy = tf.keras.mixed_precision.Policy("mixed_float16")
+tf.keras.mixed_precision.set_global_policy(policy)
+
+# ============================================================
+# 2. DATASET PATHS 
+# ============================================================
+BUSI_DIR = r"/kaggle/input/datasets/poornesh1007/busi-dataset-2/BUSI/Dataset_BUSI_with_GT"
+UBIBC_TRAIN_DIR = r"/kaggle/input/datasets/vuppalaadithyasairam/ultrasound-breast-images-for-breast-cancer/ultrasound breast classification/train"
+UBIBC_TEST_DIR = r"/kaggle/input/datasets/vuppalaadithyasairam/ultrasound-breast-images-for-breast-cancer/ultrasound breast classification/val"   
+
+BATCH_SIZE = 64
+
+# ============================================================
+# 3. GLOBAL TEXT ERASER (Applied exclusively to BUSI)
+# ============================================================
+def remove_ultrasound_text(img):
+    _, text_mask = cv2.threshold(img, 245, 255, cv2.THRESH_BINARY)
+    kernel = np.ones((3,3), np.uint8)
+    text_mask = cv2.dilate(text_mask, kernel, iterations=1)
+    img_cleaned = cv2.inpaint(img, text_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+    return img_cleaned
+
+# ============================================================
+# 4. BUSI DATASET PIPELINE
+# ============================================================
+print("\nLoading and augmenting BUSI dataset...")
+
+def apply_busi_augmentations(image):
+    augments = [cv2.equalizeHist(image), cv2.GaussianBlur(image, (5, 5), 0), cv2.bilateralFilter(image, 9, 75, 75)]
+    pixel_values = np.float32(image.reshape((-1, 1)))
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+    _, labels, centers = cv2.kmeans(pixel_values, 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+    centers = np.uint8(centers)
+    augments.append(centers[labels.flatten()].reshape((128, 128)))
+    return augments
+
+def process_and_normalize(img):
+    return np.expand_dims(img.astype(np.float16) / 255.0, axis=-1)
+
+images, labels = [], []
+for path in glob.glob(os.path.join(BUSI_DIR, "*/*.png")):
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is not None:
+        # Text erased only from BUSI images
+        img_cleaned = remove_ultrasound_text(img)
+        images.append(cv2.resize(img_cleaned, (128, 128), interpolation=cv2.INTER_AREA))
+        labels.append(1.0 if "malignant" in path else 0.0)
+
+X_train, X_val, y_train, y_val = train_test_split(images, labels, test_size=0.2, random_state=123, stratify=labels)
+
+train_x, train_y = [], []
+for img, label in zip(X_train, y_train):
+    train_x.append(process_and_normalize(img)); train_y.append(label)
+    for aug in apply_busi_augmentations(img):
+        train_x.append(process_and_normalize(aug)); train_y.append(label)
+
+busi_spatial_aug = tf.keras.Sequential([
+    layers.RandomFlip("horizontal_and_vertical"),
+    layers.RandomRotation(0.05)
+])
+
+def apply_busi_spatial_tf(x, y):
+    x = tf.cast(x, tf.float32)
+    x = tf.expand_dims(x, 0)
+    x = busi_spatial_aug(x, training=True)
+    x = tf.squeeze(x, axis=0)
+    x = tf.cast(x, tf.float16)
+    return x, y
+
+busi_train_dataset = tf.data.Dataset.from_tensor_slices((np.array(train_x, dtype=np.float16), np.array(train_y, dtype=np.float32)))
+busi_train_dataset = busi_train_dataset.map(apply_busi_spatial_tf, num_parallel_calls=tf.data.AUTOTUNE)
+
+busi_valid_dataset = tf.data.Dataset.from_tensor_slices((np.array([process_and_normalize(cv2.bilateralFilter(cv2.equalizeHist(img), 9, 75, 75)) for img in X_val], dtype=np.float16), np.array(y_val, dtype=np.float32)))
+
+
+# ============================================================
+# 5. UBIBC DATASET PIPELINE 
+# ============================================================
+print("\nLoading UBIBC dataset with FPGA-optimized alignment...")
+
+def tf_fpga_align(image, label):
+    def proc(img_tensor):
+        img_np = img_tensor.numpy().astype(np.uint8).squeeze()
+        # Directly apply baseline hardware alignment
+        img_eq = cv2.equalizeHist(img_np)
+        img_bf = cv2.bilateralFilter(img_eq, 9, 75, 75)
+        return np.expand_dims(img_bf, axis=-1).astype(np.float16) / 255.0
+        
+    aligned_img = tf.py_function(func=proc, inp=[image], Tout=tf.float16)
+    aligned_img.set_shape((128, 128, 1)) 
+    return aligned_img, tf.cast(label, tf.float32)
+
+ubibc_train_dataset = tf.keras.utils.image_dataset_from_directory(
+    UBIBC_TRAIN_DIR, validation_split=0.2, subset="training", seed=123, color_mode="grayscale", image_size=(128, 128), batch_size=None, label_mode='int'
+).map(tf_fpga_align, num_parallel_calls=tf.data.AUTOTUNE)
+
+ubibc_valid_dataset = tf.keras.utils.image_dataset_from_directory(
+    UBIBC_TRAIN_DIR, validation_split=0.2, subset="validation", seed=123, color_mode="grayscale", image_size=(128, 128), batch_size=None, label_mode='int'
+).map(tf_fpga_align, num_parallel_calls=tf.data.AUTOTUNE)
+
+ubibc_test_dataset = tf.keras.utils.image_dataset_from_directory(
+    UBIBC_TEST_DIR, color_mode="grayscale", image_size=(128, 128), batch_size=None, shuffle=False, label_mode='int'
+).map(tf_fpga_align, num_parallel_calls=tf.data.AUTOTUNE)
+
+
+# ============================================================
+# 6. MERGE DATASETS & ENFORCE SHAPES
+# ============================================================
+print("\nMerging datasets with 50/50 interleaving...")
+
+final_train_dataset = tf.data.Dataset.sample_from_datasets(
+    [busi_train_dataset.repeat(), ubibc_train_dataset.repeat()], weights=[0.5, 0.5]
+).batch(BATCH_SIZE, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
+
+final_valid_dataset = tf.data.Dataset.sample_from_datasets(
+    [busi_valid_dataset, ubibc_valid_dataset], weights=[0.5, 0.5]
+).batch(BATCH_SIZE, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
+
+def enforce_strict_shapes(x, y):
+    x = tf.ensure_shape(x, [BATCH_SIZE, 128, 128, 1])
+    y = tf.ensure_shape(y, [BATCH_SIZE])
+    return x, y
+
+final_train_dataset = final_train_dataset.map(enforce_strict_shapes, num_parallel_calls=tf.data.AUTOTUNE)
+final_valid_dataset = final_valid_dataset.map(enforce_strict_shapes, num_parallel_calls=tf.data.AUTOTUNE)
+
+
+# ============================================================
+# 7. SUPERVISED CONTRASTIVE LOSS
+# ============================================================
+class BatchContrastiveLoss(tf.keras.losses.Loss):
+    def __init__(self, margin=3.0, name="contrastive_loss"): 
+        super().__init__(name=name)
+        self.margin = margin 
+
+    def call(self, y_true, y_pred):
+        y_pred = tf.cast(y_pred, tf.float32)
+        y_true = tf.cast(y_true, tf.float32)
+
+        embeddings = tf.math.l2_normalize(y_pred, axis=1)
+
+        sq_norms = tf.reduce_sum(tf.square(embeddings), axis=1, keepdims=True)
+        dot_products = tf.matmul(embeddings, embeddings, transpose_b=True)
+        distances = sq_norms - 2.0 * dot_products + tf.transpose(sq_norms)
+        distances = tf.maximum(distances, 0.0)
+
+        y_true = tf.reshape(y_true, [-1, 1])
+        equal_labels = tf.cast(tf.equal(y_true, tf.transpose(y_true)), tf.float32)
+        not_equal_labels = 1.0 - equal_labels
+        
+        mask_off_diag = 1.0 - tf.eye(BATCH_SIZE)
+
+        pos_loss = equal_labels * distances 
+        neg_loss = not_equal_labels * tf.maximum(0.0, self.margin - distances) 
+
+        total_loss = tf.reduce_sum((pos_loss + neg_loss) * mask_off_diag)
+        num_valid_pairs = tf.reduce_sum(mask_off_diag)
+
+        return total_loss / tf.maximum(num_valid_pairs, 1.0)
+
+
+# ============================================================
+# 8. CONTRASTIVE 64D CNN ENGINE 
+# ============================================================
+l2_reg = regularizers.l2(3e-4)
+
+def fp16_dw_block(x, filters, stride=1, use_residual=True, name="block"):
+    shortcut = x
+    x = layers.DepthwiseConv2D(3, strides=stride, padding="same", use_bias=False, depthwise_regularizer=l2_reg, name=name+"_dw")(x)
+    x = layers.BatchNormalization(name=name+"_dw_bn")(x)
+    x = layers.ReLU(max_value=6.0, name=name+"_dw_relu")(x)
+    x = layers.Conv2D(filters, 1, padding="same", use_bias=False, kernel_regularizer=l2_reg, name=name+"_pw")(x)
+    x = layers.BatchNormalization(name=name+"_pw_bn")(x)
+    if use_residual: 
+        x = layers.Add(name=name+"_add")([shortcut, x])
+    return layers.ReLU(max_value=6.0, name=name+"_out_relu")(x)
+
+inputs = layers.Input(shape=(128, 128, 1), name="input_image")
+
+x = layers.Conv2D(16, 3, strides=2, padding="same", use_bias=False, kernel_regularizer=l2_reg, name="stem_conv")(inputs)
+x = layers.BatchNormalization(name="stem_conv_bn")(x)
+x = layers.ReLU(max_value=6.0, name="stem_relu")(x)
+
+x = fp16_dw_block(x, 32, stride=2, use_residual=False, name="stage1_1")
+x = fp16_dw_block(x, 32, stride=1, use_residual=True, name="stage1_2")
+x = fp16_dw_block(x, 64, stride=2, use_residual=False, name="stage2_1")
+x = fp16_dw_block(x, 64, stride=1, use_residual=True, name="stage2_2")
+x = fp16_dw_block(x, 96, stride=2, use_residual=False, name="stage3_1")
+x = fp16_dw_block(x, 96, stride=1, use_residual=True, name="stage3_2")
+x = fp16_dw_block(x, 96, stride=1, use_residual=True, name="stage3_3")
+
+x = layers.Conv2D(64, 1, padding="same", use_bias=False, kernel_regularizer=l2_reg, name="hardware_projection")(x)
+x = layers.BatchNormalization(name="hardware_projection_bn")(x)
+x = layers.ReLU(max_value=6.0, name="hardware_projection_relu")(x)
+
+features = layers.GlobalAveragePooling2D(name="hardware_features_64D")(x)
+features = layers.Dropout(0.4, name="zero_cost_dropout")(features) 
+outputs = layers.BatchNormalization(name="final_vector_norm")(features)
+
+model = tf.keras.Model(inputs, outputs, name="Contrastive_Arty7_64D")
+
+
+# ============================================================
+# 9. COMPILE & TRAIN (SGD + NESTEROV)
+# ============================================================
+optimizer = tf.keras.optimizers.SGD(learning_rate=1e-2, momentum=0.9, nesterov=True)
+model.compile(optimizer=optimizer, loss=BatchContrastiveLoss(margin=3.0))
+
+WORKING_DIR = "./working"
+os.makedirs(WORKING_DIR, exist_ok=True)
+SAVE_PATH = os.path.join(WORKING_DIR, "best_contrastive_arty7_64D_SGD.keras")
+
+lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(
+    monitor="val_loss", factor=0.5, patience=4, min_lr=1e-6, verbose=1
+)
+
+callbacks_list = [
+    tf.keras.callbacks.ModelCheckpoint(SAVE_PATH, monitor="val_loss", mode="min", save_best_only=True, verbose=1),
+    tf.keras.callbacks.EarlyStopping(monitor="val_loss", mode="min", patience=15, restore_best_weights=True, verbose=1),
+    lr_scheduler
+]
+
+print("\nStarting 64D Supervised Contrastive Training (SGD Optimizer)...")
+history = model.fit(final_train_dataset, validation_data=final_valid_dataset, epochs=60, steps_per_epoch=100, callbacks=callbacks_list)
+
+
+# ============================================================
+# 10. THE "GOLDEN RATIO" FEATURE EXTRACTION
+# ============================================================
+print("\n================ 10. FEATURE EXTRACTION & SVM ================")
+best_model = tf.keras.models.load_model(SAVE_PATH, compile=False)
+
+feature_extractor = tf.keras.Model(
+    inputs=best_model.input, outputs=best_model.get_layer("final_vector_norm").output, name="SupCon_64D_Extractor"
+)
+
+def extract_features_and_labels(dataset_stream, name="Dataset"):
+    print(f"Extracting features from {name}...")
+    features, labels = [], []
+    for batch_x, batch_y in dataset_stream:
+        features.append(feature_extractor(batch_x, training=False).numpy())
+        labels.append(batch_y.numpy())
+    return np.vstack(features), np.concatenate(labels)
+
+X_train_64D, y_train_ext = extract_features_and_labels(final_train_dataset.take(60), "Balanced 50/50 Merged Train Set")
+X_train_64D, y_train_ext = shuffle(X_train_64D, y_train_ext, random_state=123)
+
+X_busi_test_64D, y_busi_test_ext = extract_features_and_labels(busi_valid_dataset.batch(BATCH_SIZE), "BUSI Test Set")
+X_ubibc_test_64D, y_ubibc_test_ext = extract_features_and_labels(ubibc_test_dataset.batch(BATCH_SIZE), "UBIBC Test Set")
+
+
+# ============================================================
+# 11. HARDWARE-DIRECT LINEAR SVM 
+# ============================================================
+scaler = Normalizer(norm='l2')
+X_train_scaled = scaler.fit_transform(X_train_64D)
+X_busi_test_scaled = scaler.transform(X_busi_test_64D)
+X_ubibc_test_scaled = scaler.transform(X_ubibc_test_64D)
+
+param_grid = {
+    'C': [0.1, 1, 10, 50, 100, 500, 1000], 
+    'class_weight': ['balanced', {0: 1, 1: 2}, {0: 1, 1: 3}],
+    'kernel': ['linear'] 
+}
+
+print("Running GridSearch with Asymmetric Medical Penalties...")
+grid_search = GridSearchCV(
+    SVC(probability=True, random_state=123), param_grid, refit=True, verbose=1, cv=5, n_jobs=-1, scoring='f1' 
+)
+
+grid_search.fit(X_train_scaled, y_train_ext)
+best_svm = grid_search.best_estimator_
+
+# ============================================================
+# 12. THE ULTIMATE BENCHMARK CHALLENGE
+# ============================================================
+X_combined_test = np.vstack((X_busi_test_scaled, X_ubibc_test_scaled))
+y_combined_test = np.concatenate((y_busi_test_ext, y_ubibc_test_ext))
+
+y_combined_probs = best_svm.predict_proba(X_combined_test)[:, 1]
+y_opt_pred = best_svm.predict(X_combined_test)
+
+overall_accuracy = accuracy_score(y_combined_test, y_opt_pred)
+overall_f1 = f1_score(y_combined_test, y_opt_pred)
+overall_auc = roc_auc_score(y_combined_test, y_combined_probs)
+cm = confusion_matrix(y_combined_test, y_opt_pred)
+
+print(f"\n--- Final SGD Benchmark ---")
+print(f"Overall Accuracy : {overall_accuracy*100:.2f}%")
+print(f"Overall F1-Score : {overall_f1:.4f}")
+print(f"Overall ROC-AUC  : {overall_auc:.4f}\n")
+
+plt.figure(figsize=(6, 5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+            xticklabels=['Pred: Benign', 'Pred: Malignant'], 
+            yticklabels=['Actual: Benign', 'Actual: Malignant'],
+            annot_kws={"size": 14})
+plt.title("Combined Dataset Confusion Matrix\n(SGD SupCon FPGA -> Linear SVM)", fontsize=14, pad=15)
+plt.ylabel('True Medical Diagnosis', fontsize=12)
+plt.xlabel('Hybrid SVM Prediction', fontsize=12)
+plt.tight_layout()
+plt.show()
